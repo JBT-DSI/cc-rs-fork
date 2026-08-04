@@ -2608,16 +2608,16 @@ impl Build {
                     }
                 }
 
-                if target.os == "nto" || target.os == "qnx" {
-                    // Select the target with `-V`, see qcc documentation:
+                if (target.os == "nto" || target.os == "qnx") && is_qnx_qcc_driver(cmd.path()) {
+                    // Select the target with `-V` only for the qcc/q++ driver.
                     // QNX SDP 7.1: https://www.qnx.com/developers/docs/7.1/index.html#com.qnx.doc.neutrino.utilities/topic/q/qcc.html
                     // QNX SDP 8.0: https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.utilities/topic/q/qcc.html
-                    // This assumes qcc/q++ as compiler, which is currently the only supported compiler for QNX.
-                    // See for details: https://github.com/rust-lang/cc-rs/pull/1319
                     let arg = match target.full_arch {
-                        "x86" | "i586" => "-Vgcc_ntox86_cxx",
-                        "aarch64" => "-Vgcc_ntoaarch64le_cxx",
-                        "x86_64" => "-Vgcc_ntox86_64_cxx",
+                        "x86" | "i586" => Some("-Vgcc_ntox86_cxx"),
+                        "aarch64" => Some("-Vgcc_ntoaarch64le_cxx"),
+                        // x86_64 can compile without an explicit `-V...` selector and
+                        // this flag is not accepted by prefixed GNU drivers.
+                        "x86_64" => None,
                         _ => {
                             return Err(Error::new(
                                 ErrorKind::InvalidTarget,
@@ -2625,7 +2625,9 @@ impl Build {
                             ))
                         }
                     };
-                    cmd.push_cc_arg(arg.into());
+                    if let Some(arg) = arg {
+                        cmd.push_cc_arg(arg.into());
+                    }
                 }
             }
         }
@@ -3689,8 +3691,21 @@ impl Build {
                 } else if target.arch == "aarch64" && target.vendor == "kmc" {
                     format!("aarch64-kmc-elf-{gnu}").into()
                 } else if target.os == "nto" || target.os == "qnx" {
-                    // See for details: https://github.com/rust-lang/cc-rs/pull/1319
-                    if self.cpp { "q++" } else { "qcc" }.into()
+                    // Prefer target-prefixed GCC/G++ for x86_64 QNX; other QNX targets
+                    // continue using qcc/q++ defaults.
+                    match target.full_arch {
+                        "x86_64" => {
+                            if self.cpp {
+                                "x86_64-pc-nto-qnx7.1.0-g++"
+                            } else {
+                                "x86_64-pc-nto-qnx7.1.0-gcc"
+                            }
+                            .into()
+                        }
+                        _ => {
+                            if self.cpp { "q++" } else { "qcc" }.into()
+                        }
+                    }
                 } else if self.get_is_cross_compile()? {
                     let prefix = self.prefix_for_target(&raw_target);
                     match prefix {
@@ -5180,6 +5195,12 @@ fn android_clang_compiler_uses_target_arg_internally(clang_path: &Path) -> bool 
         }
     }
     false
+}
+
+fn is_qnx_qcc_driver(compiler_path: &Path) -> bool {
+    compiler_path
+        .file_stem()
+        .is_some_and(|stem| stem == "qcc" || stem == "q++")
 }
 
 fn is_llvm_mingw_wrapper(clang_path: &Path) -> bool {

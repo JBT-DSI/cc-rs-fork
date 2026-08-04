@@ -178,6 +178,46 @@ fn gnu_warnings_into_errors() {
 }
 
 #[test]
+fn qnx_x86_64_prefers_target_prefixed_gcc() {
+    let test = Test::new();
+    test.shim("x86_64-pc-nto-qnx7.1.0-gcc")
+        .shim("x86_64-pc-nto-qnx7.1.0-g++");
+
+    let compiler = test
+        .gcc()
+        .target("x86_64-pc-nto-qnx710")
+        .try_get_compiler()
+        .expect("Failed to get C compiler");
+    assert!(
+        compiler.path().to_string_lossy().contains("x86_64-pc-nto-qnx7.1.0-gcc"),
+        "expected QNX C compiler path to use target-prefixed gcc, got {:?}",
+        compiler.path()
+    );
+    assert!(
+        !compiler
+            .args()
+            .iter()
+            .any(|arg| arg == "-Vgcc_ntox86_64_cxx"),
+        "qcc-only x86_64 -V flag should not be added for target-prefixed gcc"
+    );
+
+    let compiler_cpp = test
+        .gcc()
+        .target("x86_64-pc-nto-qnx710")
+        .cpp(true)
+        .try_get_compiler()
+        .expect("Failed to get C++ compiler");
+    assert!(
+        compiler_cpp
+            .path()
+            .to_string_lossy()
+            .contains("x86_64-pc-nto-qnx7.1.0-g++"),
+        "expected QNX C++ compiler path to use target-prefixed g++, got {:?}",
+        compiler_cpp.path()
+    );
+}
+
+#[test]
 fn gnu_warnings() {
     let test = Test::gnu();
     test.gcc()
