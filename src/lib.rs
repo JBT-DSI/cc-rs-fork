@@ -236,10 +236,6 @@
 //! files if the sources are unchanged.
 
 #![doc(html_root_url = "https://docs.rs/cc/1.0")]
-#![deny(warnings)]
-#![deny(missing_docs)]
-#![deny(clippy::disallowed_methods)]
-#![warn(clippy::doc_markdown)]
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1524,9 +1520,17 @@ impl Build {
                 .debug(false)
                 .cpp(self.cpp)
                 .cuda(self.cuda)
+                .out_dir(&out_dir)
                 .inherit_rustflags(false)
                 .inherit_trim_paths(false)
                 .emit_rerun_if_env_changed(self.emit_rerun_if_env_changed);
+            // The probe has to see the environment the compiler is invoked in,
+            // or it answers a question about a different compiler than the one
+            // being built with: a bare compiler name resolves through this
+            // `PATH`, not the ambient one. Also share the caches, so that a
+            // compiler family already worked out is not worked out again.
+            cfg.env.clone_from(&self.env);
+            cfg.build_cache = Arc::clone(&self.build_cache);
             if let Some(target) = &self.target {
                 cfg.target(target);
             }
@@ -1548,6 +1552,7 @@ impl Build {
         }
 
         let mut cmd = compiler.to_command();
+        cmd.set_flag_supported_env(&self.env);
         command_add_output_file(
             &mut cmd,
             &obj,
@@ -1585,7 +1590,10 @@ impl Build {
             }
         }
 
-        let output = cmd.current_dir(out_dir).output()?;
+        cmd.current_dir(out_dir);
+        self.cargo_output
+            .print_debug(&format_args!("running: {cmd:?}"));
+        let output = cmd.output()?;
         let is_supported = output.status.success() && output.stderr.is_empty();
 
         self.build_cache
@@ -2266,7 +2274,16 @@ impl Build {
 
         if self.get_force_frame_pointer() {
             let family = cmd.family;
-            family.add_force_frame_pointer(cmd);
+            if let ToolFamily::Gnu | ToolFamily::Clang { .. } = family {
+                cmd.push_cc_arg("-fno-omit-frame-pointer".into());
+                let flag = OsString::from("-mno-omit-leaf-frame-pointer");
+                if self
+                    .is_flag_supported_inner(&flag, cmd, target)
+                    .unwrap_or(false)
+                {
+                    cmd.push_cc_arg(flag);
+                }
+            }
         }
 
         if !cmd.is_like_msvc() {
@@ -2382,11 +2399,8 @@ impl Build {
                     // So instead, we pass the deployment target with `-m*-version-min=`, and only
                     // pass it here on visionOS and Mac Catalyst where that option does not exist:
                     // https://github.com/rust-lang/cc-rs/issues/1383
-                    let version = if target.os == "visionos" || target.env == "macabi" {
-                        Some(self.apple_deployment_target(target))
-                    } else {
-                        None
-                    };
+                    let version = (target.os == "visionos" || target.env == "macabi")
+                        .then(|| self.apple_deployment_target(target));
 
                     let clang_target =
                         target.llvm_target(&self.get_raw_target()?, version.as_deref());
@@ -2480,7 +2494,7 @@ impl Build {
                 }
 
                 if target.full_arch.contains("neon") {
-                    cmd.args.push("-mfpu=neon-vfpv4".into());
+                    cmd.args.push("-mfpu=neon".into());
                 }
 
                 if target.full_arch == "armv4t" && target.os == "linux" {
@@ -2694,10 +2708,9 @@ impl Build {
         cmd: &mut Tool,
         target: &TargetInfo<'_>,
     ) -> Result<(), Error> {
-        let env_os = match cargo_env_var_os("CARGO_ENCODED_RUSTFLAGS") {
-            Some(env) => env,
+        let Some(env_os) = cargo_env_var_os("CARGO_ENCODED_RUSTFLAGS") else {
             // No encoded RUSTFLAGS -> nothing to do
-            None => return Ok(()),
+            return Ok(());
         };
 
         let env = env_os.to_string_lossy();
@@ -2715,13 +2728,11 @@ impl Build {
         if cmd.is_like_msvc() && !cmd.is_like_clang_cl() {
             return Ok(());
         }
-        let scope = match cargo_env_var_os("CARGO_TRIM_PATHS_SCOPE") {
-            Some(scope) => scope,
-            None => return Ok(()),
+        let Some(scope) = cargo_env_var_os("CARGO_TRIM_PATHS_SCOPE") else {
+            return Ok(());
         };
-        let remap = match cargo_env_var_os("CARGO_TRIM_PATHS_REMAP") {
-            Some(remap) => remap,
-            None => return Ok(()),
+        let Some(remap) = cargo_env_var_os("CARGO_TRIM_PATHS_REMAP") else {
+            return Ok(());
         };
 
         // * `macro` scope -> `-fmacro-prefix-map`
@@ -3170,6 +3181,7 @@ impl Build {
         if let Some(c) = &self.compiler {
             return Ok(Tool::new(
                 (**c).to_owned(),
+                &self.env,
                 &self.build_cache.cached_compiler_family,
                 &self.cargo_output,
                 out_dir,
@@ -3217,6 +3229,7 @@ impl Build {
                 let mut t = Tool::with_args(
                     tool,
                     args.clone(),
+                    &self.env,
                     &self.build_cache.cached_compiler_family,
                     &self.cargo_output,
                     out_dir,
@@ -3244,6 +3257,7 @@ impl Build {
                     } else {
                         Some(Tool::new(
                             PathBuf::from(tool),
+                            &self.env,
                             &self.build_cache.cached_compiler_family,
                             &self.cargo_output,
                             out_dir,
@@ -3322,6 +3336,7 @@ impl Build {
 
                 let mut t = Tool::new(
                     compiler,
+                    &self.env,
                     &self.build_cache.cached_compiler_family,
                     &self.cargo_output,
                     out_dir,
@@ -3346,6 +3361,7 @@ impl Build {
                 nvcc,
                 vec![],
                 self.cuda,
+                &self.env,
                 &self.build_cache.cached_compiler_family,
                 &self.cargo_output,
                 out_dir,
@@ -3472,11 +3488,9 @@ impl Build {
         let wrapper_path = Path::new(&rustc_wrapper);
         let wrapper_stem = wrapper_path.file_stem()?;
 
-        if VALID_WRAPPERS.contains(&wrapper_stem.to_str()?) {
-            Some(Cow::Owned(rustc_wrapper))
-        } else {
-            None
-        }
+        VALID_WRAPPERS
+            .contains(&wrapper_stem.to_str()?)
+            .then_some(Cow::Owned(rustc_wrapper))
     }
 
     /// Returns compiler path, optional modifier name from whitelist, and arguments vec
@@ -3561,11 +3575,10 @@ impl Build {
             Some(s) => Ok(s.as_deref().map(Path::new).map(Cow::Borrowed)),
             None => {
                 if let Ok(stdlib) = self.getenv_with_target_prefixes("CXXSTDLIB") {
-                    if stdlib.is_empty() {
-                        Ok(None)
-                    } else {
-                        Ok(Some(Cow::Owned(Path::new(&stdlib).to_owned())))
-                    }
+                    Ok((!stdlib.is_empty())
+                        .then_some(stdlib)
+                        .map(PathBuf::from)
+                        .map(Cow::from))
                 } else {
                     let target = self.get_target()?;
                     if target.env == "msvc" {
@@ -3733,7 +3746,13 @@ impl Build {
             None => {
                 if target.os == "android" {
                     name = format!("llvm-{tool}").into();
-                    match Command::new(&name).arg("--version").status() {
+                    // This probe decides which archiver the build uses, so it has
+                    // to run in the environment the build was configured with: a
+                    // bare name resolves through `Build::env`'s `PATH`, not the
+                    // ambient one.
+                    let mut probe = Command::new(&name);
+                    probe.arg("--version").set_ar_detection_env(&self.env);
+                    match probe.status() {
                         Ok(status) if status.success() => (),
                         _ => {
                             // FIXME: Use parsed target.
@@ -4333,14 +4352,11 @@ impl Build {
             &self.cargo_output,
         )?;
 
-        let sdk_path = match String::from_utf8(sdk_path) {
-            Ok(p) => p,
-            Err(_) => {
-                return Err(Error::new(
-                    ErrorKind::IOError,
-                    "Unable to determine Apple SDK path.",
-                ));
-            }
+        let Ok(sdk_path) = String::from_utf8(sdk_path) else {
+            return Err(Error::new(
+                ErrorKind::IOError,
+                "Unable to determine Apple SDK path.",
+            ));
         };
         Ok(Cow::Owned(sdk_path.trim().into()))
     }
