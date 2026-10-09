@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1](https://github.com/JBT-DSI/cc-rs-fork/compare/cc-v1.6.0...cc-v1.6.1) - 2026-10-09
+
+### Other
+
+- Use x86_64-pc-nto-qnx7.1.0-gcc/g++
+
 ## [1.6.0](https://github.com/rust-lang/cc-rs/compare/cc-v1.5.1...cc-v1.6.0) - 2026-10-03
 
 ### Added
